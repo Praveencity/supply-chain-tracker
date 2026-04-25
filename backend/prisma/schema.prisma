@@ -1,0 +1,48 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Carrier {
+  id           Int         @id @default(autoincrement())
+  name         String
+  contact_info String?
+  rating       Float?
+  shipments    Shipments[]
+}
+
+model Shipments {
+  id                            Int              @id @default(autoincrement())
+  priority_level                String           // Low, Medium, High
+  cargo_type                    String           // Perishable, Fragile, Standard
+  carrier_id                    Int
+  carrier                       Carrier          @relation(fields: [carrier_id], references: [id])
+  estimated_arrival_at_creation DateTime
+  status                        String           @default("Pending") // Pending, In Transit, Delivered, Delayed
+  Telemetry_Logs                Telemetry_Logs[]
+}
+
+model Telemetry_Logs {
+  id          Int       @id @default(autoincrement())
+  shipment_id Int
+  shipment    Shipments @relation(fields: [shipment_id], references: [id])
+  lat         Float
+  long        Float
+  speed       Float?
+  temperature Float?
+  timestamp   DateTime  @default(now())
+}
+
+model Geofences {
+  id          Int    @id @default(autoincrement())
+  name        String
+  center_lat  Float
+  center_long Float
+  radius_km   Float
+}
