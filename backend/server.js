@@ -125,8 +125,8 @@ app.post('/api/simulate-shipment', async (req, res) => {
       targetLat: pathCoords[1].lat,
       targetLong: pathCoords[1].long,
       status: 'In Transit',
-      delayProb: mlData.delay_probability,
-      eta: mlData.predicted_eta_hours,
+      delayProb: mlData.delay_probability || 0,
+      eta: mlData.predicted_eta_hours || 0,
       predictedDelayHours: mlData.predicted_delay_hours || 0,
       earlyDeliveryProb: mlData.early_delivery_probability || 0,
       stopTimer: 0, // Used for unloading at waypoints
@@ -134,7 +134,7 @@ app.post('/api/simulate-shipment', async (req, res) => {
       delayCauses: [],      // e.g. [{type:'Storm', addedHours:2.5}]
       currentEvent: null,   // Current event affecting the truck (informational)
       startTime: Date.now(),
-      expectedArrival: Date.now() + (mlData.predicted_eta_hours * 60 * 60 * 1000)
+      expectedArrival: Date.now() + ((mlData.predicted_eta_hours || 0) * 60 * 60 * 1000)
     };
     
     // 3. Inject into live simulation loop

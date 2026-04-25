@@ -7,12 +7,17 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
     const now = Date.now();
     const elapsedMs = selectedTruck.startTime ? now - selectedTruck.startTime : 0;
     const elapsedHours = elapsedMs / (1000 * 60 * 60);
-    const totalEtaHours = selectedTruck.eta + selectedTruck.delayAccumulated;
-    const remainingHours = Math.max(0, totalEtaHours - elapsedHours);
-    const progressPct = Math.min(100, (elapsedHours / totalEtaHours) * 100);
-    const isDelivered = selectedTruck.status.includes('Delivered');
-    const isDelayed = selectedTruck.status.includes('Late');
-    const isEarly = selectedTruck.status.includes('Early');
+    
+    // Safety check for ETA to avoid NaN in calculations
+    const eta = selectedTruck.eta || 0;
+    const delayAccum = selectedTruck.delayAccumulated || 0;
+    const totalEtaHours = eta + delayAccum;
+    
+    const remainingHours = totalEtaHours > 0 ? Math.max(0, totalEtaHours - elapsedHours) : 0;
+    const progressPct = totalEtaHours > 0 ? Math.min(100, (elapsedHours / totalEtaHours) * 100) : 0;
+    const isDelivered = selectedTruck.status?.includes('Delivered');
+    const isDelayed = selectedTruck.status?.includes('Late');
+    const isEarly = selectedTruck.status?.includes('Early');
     const inEventZone = selectedTruck.currentEvent != null;
 
     const toSimTime = (hours) => {
@@ -115,15 +120,15 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
         <div className="grid grid-cols-3 md:grid-cols-5 gap-2.5 mb-4">
           <MetricCell
             label="ML Predicted ETA"
-            value={`${selectedTruck.eta?.toFixed(1)}h`}
-            sub="Gradient Boosting model"
+            value={selectedTruck.eta != null ? `${selectedTruck.eta.toFixed(1)}h` : "Calculating..."}
+            sub={selectedTruck.eta != null ? "Gradient Boosting model" : "Awaiting AI inference"}
             valueClass="text-sky-400"
             icon={TrendingUp}
           />
           <MetricCell
             label={isDelivered ? 'Total Time' : 'Time Left'}
-            value={isDelivered ? toSimTime(elapsedHours) : toSimTime(remainingHours)}
-            sub={isDelivered ? `actual: ${elapsedHours.toFixed(1)}h` : `${remainingHours.toFixed(1)}h remaining`}
+            value={selectedTruck.eta != null ? (isDelivered ? toSimTime(elapsedHours) : toSimTime(remainingHours)) : "--:--:--"}
+            sub={isDelivered ? `actual: ${elapsedHours.toFixed(1)}h` : (selectedTruck.eta != null ? `${remainingHours.toFixed(1)}h remaining` : "calculating...")}
             valueClass={isDelayed ? 'text-red-400' : 'text-emerald-400'}
             icon={Clock}
           />
