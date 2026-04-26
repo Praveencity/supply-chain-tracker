@@ -11,7 +11,9 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 DELAY_MODEL_PATH = os.path.join(MODEL_DIR, "gb_delay_model.pkl")
 ETA_MODEL_PATH = os.path.join(MODEL_DIR, "gb_eta_model.pkl")
 DELAY_HOURS_MODEL_PATH = os.path.join(MODEL_DIR, "gb_delay_hours_model.pkl")
+ETA_MODEL_VERSION_PATH = os.path.join(MODEL_DIR, "gb_eta_model.version")
 HISTORICAL_DATA_PATH = "historical_shipments.csv"
+ETA_MODEL_VERSION = "eta_added_delay_v1"
 
 def generate_synthetic_data(num_samples=500):
     """Generate IDEAL baseline data — perfect conditions, no delays.
@@ -62,21 +64,25 @@ def train_models(df=None):
     features = ['distance', 'speed', 'traffic_level', 'weather_severity', 'carrier_rating']
     # Drop rows with any NaN values to prevent training errors
     df = df.dropna(subset=features + ['actual_eta_hours', 'delay_probability'])
-    X = df[features]
-    y_eta = df['actual_eta_hours']
-    y_delay = df['delay_probability']
-    
     # Compute delay_hours: how much longer than ideal (distance/speed) did the delivery take
     # Positive = delayed, Negative = early (faster than ideal)
     df['ideal_eta'] = df['distance'] / df['speed'].clip(lower=1)
     df['delay_hours'] = df['actual_eta_hours'] - df['ideal_eta']
+    X = df[features]
+    # ETA is predicted as ideal time + non-negative added delay. This keeps the
+    # model from learning physically impossible below-ideal travel times.
+    y_eta_added_delay = df['delay_hours'].clip(lower=0)
+    y_delay = df['delay_probability']
     y_delay_hours = df['delay_hours']
     
-    print("Training ETA Model (Gradient Boosting)...")
+    print("Training ETA Added Delay Model (Gradient Boosting)...")
     global eta_model, delay_model, delay_hours_model
     eta_model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, random_state=42)
-    eta_model.fit(X, y_eta)
+    eta_model.fit(X, y_eta_added_delay)
+    eta_model.target_semantics = ETA_MODEL_VERSION
     joblib.dump(eta_model, ETA_MODEL_PATH)
+    with open(ETA_MODEL_VERSION_PATH, "w") as f:
+        f.write(ETA_MODEL_VERSION)
     
     print("Training Delay Probability Model (Gradient Boosting)...")
     delay_model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, random_state=42)
@@ -207,6 +213,7 @@ def predict_delay(data, traffic_level=1, weather_severity=1):
 def predict_eta(data, traffic_level=1, weather_severity=1):
     # Use real road distance if passed directly, else fall back to lat/lon estimate
     dist_miles = _get_distance_miles(data)
+    ideal_eta = dist_miles / max(data.speed, 1)
     
     X_pred = pd.DataFrame([{
         'distance': dist_miles,
@@ -216,13 +223,15 @@ def predict_eta(data, traffic_level=1, weather_severity=1):
         'carrier_rating': data.carrier_rating
     }])
     
-    return eta_model.predict(X_pred)[0]
+    raw_added_delay = eta_model.predict(X_pred)[0]
+    return ideal_eta + raw_added_delay
 
 def predict_delay_hours(data, traffic_level=1, weather_severity=1):
     """Predict how many hours of delay (positive) or early arrival (negative) to expect.
     This is the MODEL-DRIVEN delay/early classification — not event-based.
     """
     dist_miles = _get_distance_miles(data)
+    ideal_eta = dist_miles / max(data.speed, 1)
     
     X_pred = pd.DataFrame([{
         'distance': dist_miles,
@@ -232,4 +241,7 @@ def predict_delay_hours(data, traffic_level=1, weather_severity=1):
         'carrier_rating': data.carrier_rating
     }])
     
-    return delay_hours_model.predict(X_pred)[0]
+    raw_delay_hours = delay_hours_model.predict(X_pred)[0]
+    # Delay hours are relative to ideal ETA. Early arrival cannot reasonably exceed
+    # 25% of ideal travel time, and delays are capped to avoid unstable UI values.
+    return float(np.clip(raw_delay_hours, -ideal_eta * 0.25, ideal_eta * 3.0))

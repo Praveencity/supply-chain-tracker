@@ -248,6 +248,8 @@ class ShipmentData(BaseModel):
     speed: float
     is_weekend: bool
     hour_of_day: int
+    traffic_level: int = 1
+    weather_severity: int = 1
 
 @app.get("/api/health")
 def health_check():
@@ -257,9 +259,9 @@ def health_check():
 def get_predictions(data: ShipmentData):
     try:
         # Pass to ML Pipeline — model-driven predictions
-        delay_prob = predict_delay(data)
-        eta_hours = predict_eta(data)
-        delay_hrs = predict_delay_hours(data)
+        delay_prob = predict_delay(data, data.traffic_level, data.weather_severity)
+        eta_hours = predict_eta(data, data.traffic_level, data.weather_severity)
+        delay_hrs = predict_delay_hours(data, data.traffic_level, data.weather_severity)
         
         # Get historical route stats for early delivery probability
         route_stats = get_route_stats()

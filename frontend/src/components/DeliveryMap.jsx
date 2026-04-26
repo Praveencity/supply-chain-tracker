@@ -61,7 +61,6 @@ const createEventLabel = (ev) => {
   const icons = { Storm: '🌩️', Accident: '💥', Breakdown: '🔧', Traffic: '🚦' };
   const colors = { Storm: '#38bdf8', Accident: '#ef4444', Breakdown: '#f97316', Traffic: '#eab308' };
   const c = colors[ev.type] || '#eab308';
-  const timeLeft = Math.max(0, Math.ceil((ev.expiresAt - Date.now()) / 1000));
   const html = `<div style="
     background:rgba(15,23,42,0.92);border:1px solid ${c}55;border-radius:8px;
     padding:4px 8px;font-size:10px;font-weight:bold;color:${c};
@@ -166,11 +165,11 @@ export default function DeliveryMap({ shipments, worldEvents = [], onSelectTruck
 
   // Completed portion of path (trail behind truck)
   const completedPath = selectedTruck?.path?.length > 1 && selectedTruck.pathIndex > 0
-    ? selectedTruck.path.slice(0, selectedTruck.pathIndex + 1).map(p => [p.lat, p.long])
+    ? [...selectedTruck.path.slice(0, selectedTruck.pathIndex + 1).map(p => [p.lat, p.long]), [selectedTruck.lat, selectedTruck.long]]
     : null;
   // Remaining path ahead
   const remainingPath = selectedTruck?.path?.length > 1
-    ? selectedTruck.path.slice(selectedTruck.pathIndex).map(p => [p.lat, p.long])
+    ? [[selectedTruck.lat, selectedTruck.long], ...selectedTruck.path.slice((selectedTruck.pathIndex || 0) + 1).map(p => [p.lat, p.long])]
     : null;
 
   // Stats overlay data
@@ -292,7 +291,13 @@ export default function DeliveryMap({ shipments, worldEvents = [], onSelectTruck
           const isEarly = shipment.status.includes('Early');
           const inEventZone = shipment.status.includes('Zone');
           const accentColor = isDelayed ? '#ef4444' : isEarly ? '#22d3ee' : isDelivered ? '#10b981' : inEventZone ? '#f59e0b' : '#38bdf8';
-          const elapsedH = shipment.startTime ? ((Date.now() - shipment.startTime) / 3600000).toFixed(1) : '—';
+          const elapsedH = shipment.elapsedHours != null ? shipment.elapsedHours.toFixed(1) : '—';
+          const mlEtaH = shipment.mlPredictedEtaHours != null ? shipment.mlPredictedEtaHours.toFixed(1) : (shipment.eta != null ? shipment.eta.toFixed(1) : '—');
+          const liveEtaH = shipment.liveEtaHours != null ? shipment.liveEtaHours.toFixed(1) : (shipment.remainingEtaHours != null ? shipment.remainingEtaHours.toFixed(1) : '—');
+          const finalDelayH = isDelivered && mlEtaH !== '—' 
+            ? (parseFloat(elapsedH) - parseFloat(mlEtaH)).toFixed(1)
+            : (liveEtaH !== '—' && mlEtaH !== '—' ? (parseFloat(liveEtaH) - parseFloat(mlEtaH)).toFixed(1) : '0.0');
+          const distanceLeft = shipment.distanceLeftMiles != null ? shipment.distanceLeftMiles.toFixed(1) : '—';
           return (
             <Marker
               key={shipment.id}
@@ -305,14 +310,17 @@ export default function DeliveryMap({ shipments, worldEvents = [], onSelectTruck
                   <p style={{ margin: 0, color: accentColor, fontSize: '14px' }}>🚛 {shipment.id}</p>
                   <p style={{ margin: '4px 0 0', fontWeight: 'normal', color: '#94a3b8', fontSize: '11px' }}>{shipment.status}</p>
                   {shipment.origin && <p style={{ margin: '4px 0 0', fontSize: '11px', color: '#64748b' }}>{shipment.origin} → {shipment.destination}</p>}
-                  <div style={{ margin: '6px 0 0', display: 'flex', gap: '8px', fontSize: '10px', color: '#64748b' }}>
-                    <span>ETA: <b style={{ color: '#38bdf8' }}>{shipment.eta?.toFixed(1)}h</b></span>
+                  <div style={{ margin: '6px 0 0', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 8px', fontSize: '10px', color: '#64748b' }}>
+                    <span>Distance: <b style={{ color: '#e2e8f0' }}>{distanceLeft} mi</b></span>
                     <span>Elapsed: <b style={{ color: '#e2e8f0' }}>{elapsedH}h</b></span>
+                    <span>ML ETA: <b style={{ color: '#38bdf8' }}>{mlEtaH}h</b></span>
+                    <span>Live ETA: <b style={{ color: '#f8fafc' }}>{liveEtaH}h</b></span>
+                    <span>Added delay: <b style={{ color: shipment.delayAccumulated > 0.5 ? '#f59e0b' : shipment.delayAccumulated > 0 ? '#f59e0b' : '#10b981' }}>+{(shipment.delayAccumulated || 0).toFixed(1)}h</b></span>
+                    <span>Final delay: <b style={{ color: parseFloat(finalDelayH) > 0.5 ? '#ef4444' : parseFloat(finalDelayH) > 0 ? '#f59e0b' : '#10b981' }}>{parseFloat(finalDelayH) > 0 ? '+' : ''}{finalDelayH}h</b></span>
                   </div>
-                  {shipment.predictedDelayHours != null && (
-                    <div style={{ margin: '4px 0 0', fontSize: '10px', color: '#64748b' }}>
-                      ML Delay: <b style={{ color: shipment.predictedDelayHours > 0.5 ? '#ef4444' : '#10b981' }}>{shipment.predictedDelayHours > 0 ? '+' : ''}{shipment.predictedDelayHours.toFixed(1)}h</b>
-                      {' · '}Early: <b style={{ color: '#22d3ee' }}>{(shipment.earlyDeliveryProb || 0).toFixed(0)}%</b>
+                  {shipment.etaRevisionCount > 0 && (
+                    <div style={{ margin: '3px 0 0', fontSize: '9px', color: '#38bdf8' }}>
+                      ETA refreshed {shipment.etaRevisionCount}x after route event{shipment.etaRevisionCount > 1 ? 's' : ''}
                     </div>
                   )}
                   {shipment.delayCauses?.length > 0 && (

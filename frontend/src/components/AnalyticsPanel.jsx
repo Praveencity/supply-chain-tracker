@@ -1,65 +1,60 @@
-import React from 'react';
 import { Activity, Clock, MapPin, Zap, TrendingUp, AlertTriangle } from 'lucide-react';
 
-export default function AnalyticsPanel({ shipments, selectedTruck, clearSelection }) {
+const MetricCell = ({ label, value, sub, valueClass = 'text-white', icon: Icon }) => (
+  <div className="bg-dark-900/60 rounded-xl p-3 border border-dark-700 hover:border-dark-700/80 transition-colors">
+    <div className="flex items-center gap-1.5 mb-1">
+      {Icon && <Icon size={11} className="text-slate-600" />}
+      <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">{label}</p>
+    </div>
+    <p className={`text-lg font-bold leading-tight ${valueClass}`}>{value}</p>
+    {sub && <p className="text-[10px] text-slate-500 mt-0.5">{sub}</p>}
+  </div>
+);
+
+export default function AnalyticsPanel({ selectedTruck, clearSelection }) {
   if (!selectedTruck) return null;
 
-    const now = Date.now();
-    const elapsedMs = selectedTruck.startTime ? now - selectedTruck.startTime : 0;
-    const elapsedHours = elapsedMs / (1000 * 60 * 60);
+    const elapsedHours = selectedTruck.elapsedHours || 0;
     
-    // Safety check for ETA to avoid NaN in calculations
-    const eta = selectedTruck.eta || 0;
-    const delayAccum = selectedTruck.delayAccumulated || 0;
-    const totalEtaHours = eta + delayAccum;
-    
-    const remainingHours = totalEtaHours > 0 ? Math.max(0, totalEtaHours - elapsedHours) : 0;
-    const progressPct = totalEtaHours > 0 ? Math.min(100, (elapsedHours / totalEtaHours) * 100) : 0;
     const isDelivered = selectedTruck.status?.includes('Delivered');
+    const initialMlEtaHours = selectedTruck.mlPredictedEtaHours ?? selectedTruck.eta ?? 0;
+    const liveEtaHours = selectedTruck.liveEtaHours ?? selectedTruck.remainingEtaHours ?? 0;
+    const finalDelayHours = isDelivered ? elapsedHours - initialMlEtaHours : (selectedTruck.liveDelayHours ?? Math.max(0, liveEtaHours - initialMlEtaHours));
     const isDelayed = selectedTruck.status?.includes('Late');
     const isEarly = selectedTruck.status?.includes('Early');
     const inEventZone = selectedTruck.currentEvent != null;
 
-    const toSimTime = (hours) => {
-      const totalSec = Math.round(Math.abs(hours) * 3600);
-      const h = Math.floor(totalSec / 3600);
-      const m = Math.floor((totalSec % 3600) / 60);
-      const s = totalSec % 60;
-      return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    };
+    const formatHours = (hours) => `${Math.max(0, hours).toFixed(1)}h`;
+    const formatMiles = (miles) => `${Math.max(0, miles).toFixed(1)} mi`;
 
     // Path progress
     const pathTotal = selectedTruck.path?.length || 1;
     const pathDone = Math.min(selectedTruck.pathIndex || 0, pathTotal);
     const pathPct = Math.round((pathDone / Math.max(pathTotal - 1, 1)) * 100);
+    const progressPct = isDelivered ? 100 : pathPct;
 
-    // Status color
-    const statusColor = isEarly ? 'cyan' : isDelayed ? 'red' : isDelivered ? 'emerald' : inEventZone ? 'yellow' : 'sky';
-    const statusBg = `bg-${statusColor}-900/40`;
-    const statusText = `text-${statusColor}-400`;
-
-    const MetricCell = ({ label, value, sub, valueClass = 'text-white', icon: Icon }) => (
-      <div className="bg-dark-900/60 rounded-xl p-3 border border-dark-700 hover:border-dark-700/80 transition-colors">
-        <div className="flex items-center gap-1.5 mb-1">
-          {Icon && <Icon size={11} className="text-slate-600" />}
-          <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">{label}</p>
-        </div>
-        <p className={`text-lg font-bold leading-tight ${valueClass}`}>{value}</p>
-        {sub && <p className="text-[10px] text-slate-500 mt-0.5">{sub}</p>}
-      </div>
-    );
+    const statusClasses = isEarly
+      ? { bg: 'bg-cyan-900/40', text: 'text-cyan-400', border: 'border-cyan-500/20' }
+      : isDelayed
+        ? { bg: 'bg-red-900/40', text: 'text-red-400', border: 'border-red-500/20' }
+        : isDelivered
+          ? { bg: 'bg-emerald-900/40', text: 'text-emerald-400', border: 'border-emerald-500/20' }
+          : inEventZone
+            ? { bg: 'bg-yellow-900/40', text: 'text-yellow-400', border: 'border-yellow-500/20' }
+            : { bg: 'bg-sky-900/40', text: 'text-sky-400', border: 'border-sky-500/20' };
 
     // Event timing calculations
     const events = selectedTruck.delayCauses || [];
     const totalEventHours = selectedTruck.delayAccumulated || 0;
+    const distanceLeftMiles = selectedTruck.distanceLeftMiles ?? 0;
 
     return (
       <div className="glass-panel p-5 border border-dark-700">
 
         {/* Title Row */}
         <div className="flex items-start gap-3 mb-4">
-          <div className={`p-1.5 rounded-lg ${statusBg}`}>
-            <Activity className={statusText} size={16} />
+          <div className={`p-1.5 rounded-lg ${statusClasses.bg}`}>
+            <Activity className={statusClasses.text} size={16} />
           </div>
           <div className="flex-1 min-w-0">
             <h3 className="text-base font-bold text-white">{selectedTruck.id} — Live Telemetry</h3>
@@ -69,7 +64,7 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
               </p>
             )}
           </div>
-          <span className={`shrink-0 text-xs font-bold px-2.5 py-1 rounded-lg ${statusBg} ${statusText} border border-${statusColor}-500/20`}>
+          <span className={`shrink-0 text-xs font-bold px-2.5 py-1 rounded-lg ${statusClasses.bg} ${statusClasses.text} border ${statusClasses.border}`}>
             {selectedTruck.status}
           </span>
           {isDelivered && (
@@ -92,7 +87,7 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
         <div className="mb-5">
           <div className="flex justify-between text-xs text-slate-400 mb-1.5">
             <span className="flex items-center gap-1"><MapPin size={10} /> Journey Progress</span>
-            <span className="font-mono">{isDelivered ? '100' : progressPct.toFixed(1)}% · Node {pathDone}/{pathTotal - 1}</span>
+            <span className="font-mono">{progressPct.toFixed(1)}% · Node {pathDone}/{pathTotal - 1}</span>
           </div>
           <div className="w-full h-3 bg-dark-900 rounded-full overflow-hidden relative">
             {/* Event zone markers on progress bar */}
@@ -107,7 +102,7 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
             })}
             <div
               className={`h-full rounded-full transition-all duration-700 relative z-[1] ${isDelayed ? 'bg-gradient-to-r from-red-600 to-red-400' : isEarly ? 'bg-gradient-to-r from-cyan-600 to-cyan-400' : 'bg-gradient-to-r from-brand-dark to-brand-light'}`}
-              style={{ width: `${isDelivered ? 100 : progressPct}%` }}
+              style={{ width: `${progressPct}%` }}
             />
           </div>
           <div className="flex justify-between text-[10px] text-slate-600 mt-1">
@@ -117,64 +112,47 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
         </div>
 
         {/* Primary Metrics */}
-        <div className="grid grid-cols-3 md:grid-cols-5 gap-2.5 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2.5 mb-4">
+          <MetricCell
+            label="Distance Left"
+            value={isDelivered ? '0.0 mi' : formatMiles(distanceLeftMiles)}
+            sub="remaining route"
+            valueClass="text-violet-300"
+            icon={MapPin}
+          />
+          <MetricCell
+            label="Time Elapsed"
+            value={formatHours(elapsedHours)}
+            sub="since departure"
+            icon={Clock}
+          />
+          <MetricCell
+            label="Added Delay"
+            value={totalEventHours > 0 ? `+${totalEventHours.toFixed(1)}h` : '0.0h'}
+            sub={events.length > 0 ? `${events.length} event${events.length > 1 ? 's' : ''}` : 'no route delays'}
+            valueClass={totalEventHours > 0 ? 'text-yellow-400' : 'text-emerald-400'}
+            icon={Zap}
+          />
           <MetricCell
             label="ML Predicted ETA"
-            value={selectedTruck.eta != null ? `${selectedTruck.eta.toFixed(1)}h` : "Calculating..."}
-            sub={selectedTruck.eta != null ? "Gradient Boosting model" : "Awaiting AI inference"}
+            value={initialMlEtaHours ? formatHours(initialMlEtaHours) : 'Calculating...'}
+            sub="fixed at trip start"
             valueClass="text-sky-400"
             icon={TrendingUp}
           />
           <MetricCell
-            label={isDelivered ? 'Total Time' : 'Time Left'}
-            value={selectedTruck.eta != null ? (isDelivered ? toSimTime(elapsedHours) : toSimTime(remainingHours)) : "--:--:--"}
-            sub={isDelivered ? `actual: ${elapsedHours.toFixed(1)}h` : (selectedTruck.eta != null ? `${remainingHours.toFixed(1)}h remaining` : "calculating...")}
-            valueClass={isDelayed ? 'text-red-400' : 'text-emerald-400'}
-            icon={Clock}
-          />
-          <MetricCell
-            label="Elapsed"
-            value={toSimTime(elapsedHours)}
-            sub={`${elapsedHours.toFixed(1)}h since departure`}
-            icon={Clock}
-          />
-          <MetricCell
-            label="ML Delay Prediction"
-            value={`${selectedTruck.predictedDelayHours > 0 ? '+' : ''}${(selectedTruck.predictedDelayHours || 0).toFixed(1)}h`}
-            sub={selectedTruck.predictedDelayHours > 0.5 ? 'delay expected' : selectedTruck.predictedDelayHours < -0.5 ? 'early expected' : 'on-time expected'}
-            valueClass={selectedTruck.predictedDelayHours > 0.5 ? 'text-red-400' : selectedTruck.predictedDelayHours < -0.5 ? 'text-cyan-400' : 'text-emerald-400'}
-            icon={Zap}
-          />
-          <MetricCell
-            label="Early Chance"
-            value={`${(selectedTruck.earlyDeliveryProb || 0).toFixed(0)}%`}
-            sub="historical probability"
-            valueClass={selectedTruck.earlyDeliveryProb > 50 ? 'text-cyan-400' : 'text-slate-300'}
+            label="Live ETA"
+            value={isDelivered ? '0.0h' : formatHours(liveEtaHours)}
+            sub={selectedTruck.etaRevisionCount ? `refreshed ${selectedTruck.etaRevisionCount}x by events` : 'same model, live inputs'}
+            valueClass={totalEventHours > 0 ? 'text-orange-400' : 'text-white'}
             icon={TrendingUp}
           />
-        </div>
-
-        {/* Secondary Metrics */}
-        <div className="grid grid-cols-4 gap-2.5 mb-4">
-          <MetricCell label="Departure" value="T+0" sub="simulation start" />
           <MetricCell
-            label="Event Impact"
-            value={totalEventHours > 0 ? `+${totalEventHours.toFixed(1)}h` : 'None'}
-            sub={events.length > 0 ? `${events.length} event${events.length > 1 ? 's' : ''} hit` : 'clear journey'}
-            valueClass={totalEventHours > 0 ? 'text-yellow-400' : 'text-emerald-400'}
+            label="Final Delay"
+            value={isDelivered ? (finalDelayHours > 0 ? `+${finalDelayHours.toFixed(1)}h` : `${finalDelayHours.toFixed(1)}h`) : (finalDelayHours > 0 ? `+${finalDelayHours.toFixed(1)}h` : '0.0h')}
+            sub={isDelivered ? 'actual - ML predicted' : 'live ETA - ML predicted'}
+            valueClass={finalDelayHours > 0.5 ? 'text-red-400' : finalDelayHours > 0 ? 'text-yellow-400' : 'text-emerald-400'}
             icon={AlertTriangle}
-          />
-          <MetricCell
-            label={isDelivered ? 'Arrived' : 'ETA Clock'}
-            value={toSimTime(totalEtaHours)}
-            sub={isDelayed ? 'behind schedule' : isEarly ? 'ahead of schedule' : 'on schedule'}
-            valueClass={isDelayed ? 'text-orange-400' : isEarly ? 'text-cyan-400' : 'text-white'}
-          />
-          <MetricCell
-            label="Outcome"
-            value={isDelivered ? (isEarly ? '⚡ Early' : isDelayed ? '🔴 Late' : '✅ On-Time') : '⏳ In Progress'}
-            sub={isDelivered ? (isEarly ? `${selectedTruck.earlyBy}h ahead` : isDelayed ? 'ML vs actual' : 'delivered') : 'awaiting'}
-            valueClass={isEarly ? 'text-cyan-400' : isDelivered && !isDelayed ? 'text-emerald-400' : isDelayed ? 'text-red-400' : 'text-brand-light'}
           />
         </div>
 
@@ -230,7 +208,7 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
             </div>
 
             <div className="mt-3 pt-2 border-t border-yellow-500/10 flex items-center justify-between">
-              <p className="text-[10px] text-slate-500">Events slowed the truck but <b className="text-yellow-400">ML model</b> judges final delay/early status</p>
+              <p className="text-[10px] text-slate-500">Live ETA is recalculated with the <b className="text-yellow-400">ML model</b> when route events are encountered</p>
               <p className="text-xs font-bold text-yellow-400">Σ +{totalEventHours.toFixed(1)}h</p>
             </div>
           </div>
@@ -259,7 +237,7 @@ export default function AnalyticsPanel({ shipments, selectedTruck, clearSelectio
               <p className="text-xs font-bold text-yellow-400">
                 Passing through {selectedTruck.currentEvent} zone — speed reduced
               </p>
-              <p className="text-[10px] text-slate-400 mt-0.5">ML model will evaluate final delivery status at destination. Events affect speed but not the delay/early classification.</p>
+              <p className="text-[10px] text-slate-400 mt-0.5">The same ML model recalculates live ETA with current route conditions.</p>
             </div>
           </div>
         )}

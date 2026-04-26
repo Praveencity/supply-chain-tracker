@@ -2,10 +2,11 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { PrismaClient } from '@prisma/client';
 import pg from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import dotenv from 'dotenv';
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg;
 
 dotenv.config();
 
@@ -56,10 +57,163 @@ app.post('/api/shipments', async (req, res) => {
 });
 
 let simSpeedMultiplier = 1.0;
+const SIM_HOURS_PER_TICK = 1;
+let appConfig = {
+  onTheFlyModelTraining: true
+};
+
+const EVENT_CONDITIONS = {
+  Traffic: { trafficLevel: 8, weatherSeverity: 1 },
+  Accident: { trafficLevel: 10, weatherSeverity: 1 },
+  Storm: { trafficLevel: 5, weatherSeverity: 9 },
+  Breakdown: { trafficLevel: 6, weatherSeverity: 2 }
+};
+
+const getRouteDistanceBetween = (a, b) => {
+  if (!a || !b) return 0;
+  return Math.sqrt(Math.pow(b.lat - a.lat, 2) + Math.pow(b.long - a.long, 2));
+};
+
+const getRouteMapDistance = (path = []) => {
+  return path.slice(0, -1).reduce((sum, point, index) => {
+    return sum + getRouteDistanceBetween(point, path[index + 1]);
+  }, 0);
+};
+
+const getRemainingMapDistance = (ship) => {
+  if (!ship.path?.length) return 0;
+
+  const currentIndex = Math.min(ship.pathIndex || 0, ship.path.length - 1);
+  const currentPoint = { lat: ship.lat, long: ship.long };
+  const targetPoint = ship.path[currentIndex + 1];
+  let remainingMapDistance = targetPoint ? getRouteDistanceBetween(currentPoint, targetPoint) : 0;
+
+  for (let i = currentIndex + 1; i < ship.path.length - 1; i++) {
+    remainingMapDistance += getRouteDistanceBetween(ship.path[i], ship.path[i + 1]);
+  }
+
+  return remainingMapDistance;
+};
+
+const getRemainingRoadDistanceMiles = (ship) => {
+  if (!ship.path?.length || !ship.roadDistanceMiles) return 0;
+
+  const totalMapDistance = getRouteMapDistance(ship.path);
+  if (totalMapDistance <= 0) return ship.roadDistanceMiles;
+  const remainingMapDistance = getRemainingMapDistance(ship);
+
+  return Math.max(0, ship.roadDistanceMiles * (remainingMapDistance / totalMapDistance));
+};
+
+const getIdealHours = (distanceMiles, speed) => distanceMiles / Math.max(speed || 50.0, 1);
+
+const clampPrediction = (value, min, max) => Math.min(Math.max(value, min), max);
+
+const normalizePrediction = (mlData, distanceMiles, speed) => {
+  const idealHours = getIdealHours(distanceMiles, speed);
+  return {
+    etaHours: clampPrediction(mlData.predicted_eta_hours || idealHours, idealHours, idealHours * 4.0),
+    delayHours: clampPrediction(mlData.predicted_delay_hours || 0, -idealHours * 0.25, idealHours * 3.0),
+    idealHours
+  };
+};
+
+const getPredictionConditions = (event) => {
+  return EVENT_CONDITIONS[event?.type] || {
+    trafficLevel: new Date().getHours() > 8 && new Date().getHours() < 18 ? 3 : 1,
+    weatherSeverity: 1
+  };
+};
+
+const updateLiveTelemetry = (ship) => {
+  const distanceLeftMiles = getRemainingRoadDistanceMiles(ship);
+  const timeLeftHours = getIdealHours(distanceLeftMiles, ship.speedLimit || 50.0);
+  const scheduledLiveEtaHours = Math.max(0, (ship.liveExpectedArrivalHours || ship.expectedArrivalHours || ship.eta || 0) - (ship.elapsedHours || 0));
+  const liveEtaHours = Math.max(scheduledLiveEtaHours, timeLeftHours);
+
+  ship.distanceLeftMiles = parseFloat(distanceLeftMiles.toFixed(1));
+  ship.timeLeftHours = parseFloat(timeLeftHours.toFixed(2));
+  ship.idealRemainingHours = ship.timeLeftHours;
+  ship.liveEtaHours = parseFloat(liveEtaHours.toFixed(2));
+  ship.remainingEtaHours = ship.liveEtaHours;
+  ship.liveDelayHours = parseFloat(Math.max(0, ship.liveEtaHours - ship.timeLeftHours).toFixed(2));
+  ship.eta = ship.liveExpectedArrivalHours || ship.expectedArrivalHours || ship.eta;
+};
+
+const refreshShipmentPrediction = async (ship, event) => {
+  if (ship.predictionInFlight || ship.status?.includes('Delivered')) return;
+
+  const remainingDistanceMiles = getRemainingRoadDistanceMiles(ship);
+  if (remainingDistanceMiles <= 0) return;
+
+  ship.predictionInFlight = true;
+  try {
+    const conditions = getPredictionConditions(event);
+    const mlResponse = await fetch('http://localhost:8000/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        priority_level: 'Standard',
+        cargo_type: 'Standard',
+        carrier_rating: 4.0,
+        current_lat: ship.lat,
+        current_long: ship.long,
+        destination_lat: ship.path[ship.path.length - 1].lat,
+        destination_long: ship.path[ship.path.length - 1].long,
+        distance_miles: remainingDistanceMiles,
+        speed: ship.speedLimit || 50.0,
+        is_weekend: false,
+        hour_of_day: new Date().getHours(),
+        traffic_level: conditions.trafficLevel,
+        weather_severity: conditions.weatherSeverity
+      })
+    });
+
+    const mlData = await mlResponse.json();
+    if (!mlResponse.ok || mlData.error) throw new Error(mlData.error || mlData.detail || 'Prediction failed');
+    if (ship.status?.includes('Delivered')) return;
+
+    const elapsedHours = ship.elapsedHours || 0;
+    const prediction = normalizePrediction(mlData, remainingDistanceMiles, ship.speedLimit || 50.0);
+    const remainingEtaHours = Math.max(0, prediction.etaHours);
+    ship.liveExpectedArrivalHours = parseFloat((elapsedHours + remainingEtaHours).toFixed(2));
+    ship.liveEtaHours = parseFloat(remainingEtaHours.toFixed(2));
+    ship.remainingEtaHours = ship.liveEtaHours;
+    ship.timeLeftHours = parseFloat(prediction.idealHours.toFixed(2));
+    ship.idealRemainingHours = ship.timeLeftHours;
+    ship.liveDelayHours = parseFloat(Math.max(0, ship.liveEtaHours - ship.timeLeftHours).toFixed(2));
+    ship.delayProb = mlData.delay_probability || 0;
+    ship.predictedDelayHours = parseFloat(prediction.delayHours.toFixed(2));
+    ship.earlyDeliveryProb = mlData.early_delivery_probability || 0;
+    ship.expectedArrivalHours = ship.liveExpectedArrivalHours;
+    ship.eta = ship.liveExpectedArrivalHours;
+    ship.etaUpdatedAt = Date.now();
+    ship.etaRevisionCount = (ship.etaRevisionCount || 0) + 1;
+    ship.lastPredictionEventId = event?.id || null;
+    ship.lastPredictionTrafficLevel = conditions.trafficLevel;
+    ship.lastPredictionWeatherSeverity = conditions.weatherSeverity;
+    updateLiveTelemetry(ship);
+  } catch (err) {
+    console.error(`ML prediction refresh error for ${ship.id}:`, err);
+  } finally {
+    ship.predictionInFlight = false;
+  }
+};
 
 app.post('/api/sim-speed', (req, res) => {
   simSpeedMultiplier = parseFloat(req.body.multiplier) || 1.0;
   res.json({ success: true, multiplier: simSpeedMultiplier });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json(appConfig);
+});
+
+app.patch('/api/config', (req, res) => {
+  if (typeof req.body.onTheFlyModelTraining === 'boolean') {
+    appConfig.onTheFlyModelTraining = req.body.onTheFlyModelTraining;
+  }
+  res.json({ success: true, config: appConfig });
 });
 
 app.get('/api/shipments', (req, res) => {
@@ -110,6 +264,8 @@ app.post('/api/simulate-shipment', async (req, res) => {
     const mlData = await mlResponse.json();
     // Real road distance in miles (graph cost converted: 1 unit ≈ 69 miles)
     const roadDistanceMiles = routeData.cost * 69.0;
+    const speedLimit = parseFloat(speed) || 50.0;
+    const prediction = normalizePrediction(mlData, roadDistanceMiles, speedLimit);
     
     // 2. Create Dummy Vehicle with Path
     const newId = `SHP-${Math.floor(Math.random() * 1000) + 2000}`;
@@ -125,16 +281,27 @@ app.post('/api/simulate-shipment', async (req, res) => {
       targetLat: pathCoords[1].lat,
       targetLong: pathCoords[1].long,
       status: 'In Transit',
+      speedLimit,
       delayProb: mlData.delay_probability || 0,
-      eta: mlData.predicted_eta_hours || 0,
-      predictedDelayHours: mlData.predicted_delay_hours || 0,
+      mlPredictedEtaHours: prediction.etaHours,
+      liveExpectedArrivalHours: prediction.etaHours,
+      liveEtaHours: prediction.etaHours,
+      eta: prediction.etaHours,
+      remainingEtaHours: prediction.etaHours,
+      timeLeftHours: prediction.idealHours,
+      idealRemainingHours: prediction.idealHours,
+      liveDelayHours: Math.max(0, prediction.etaHours - prediction.idealHours),
+      predictedDelayHours: prediction.delayHours,
       earlyDeliveryProb: mlData.early_delivery_probability || 0,
       stopTimer: 0, // Used for unloading at waypoints
       delayAccumulated: 0,
       delayCauses: [],      // e.g. [{type:'Storm', addedHours:2.5}]
       currentEvent: null,   // Current event affecting the truck (informational)
       startTime: Date.now(),
-      expectedArrival: Date.now() + ((mlData.predicted_eta_hours || 0) * 60 * 60 * 1000)
+      elapsedHours: 0,
+      distanceLeftMiles: roadDistanceMiles,
+      expectedArrivalHours: prediction.etaHours,
+      etaRevisionCount: 0
     };
     
     // 3. Inject into live simulation loop
@@ -168,6 +335,65 @@ io.on('connection', (socket) => {
 
 // Real-Time Simulation Loop
 let activeShipments = [];
+
+const completeShipment = (ship) => {
+  const destinationPoint = ship.path?.[ship.path.length - 1];
+  if (destinationPoint) {
+    ship.lat = destinationPoint.lat;
+    ship.long = destinationPoint.long;
+    ship.pathIndex = ship.path.length - 1;
+  }
+
+  const actualElapsedHours = ship.elapsedHours || 0;
+  const predictedEta = ship.mlPredictedEtaHours || ship.eta || 0;
+  const difference = actualElapsedHours - predictedEta;
+
+  if (difference > 0.1) {
+    ship.status = `Delivered Late (by ${difference.toFixed(1)}h)`;
+    ship.earlyBy = 0;
+  } else if (difference < -0.1) {
+    const earlyBy = Math.abs(difference);
+    ship.status = `Delivered Early (by ${earlyBy.toFixed(1)}h)`;
+    ship.earlyBy = parseFloat(earlyBy.toFixed(1));
+  } else {
+    ship.status = 'Delivered On-Time';
+    ship.earlyBy = 0;
+  }
+
+  ship.currentEvent = null;
+  ship.stopTimer = 0;
+  ship.predictionInFlight = false;
+  ship.distanceLeftMiles = 0;
+  ship.timeLeftHours = 0;
+  ship.idealRemainingHours = 0;
+  ship.liveEtaHours = 0;
+  ship.remainingEtaHours = 0;
+  ship.liveDelayHours = 0;
+  ship.liveExpectedArrivalHours = actualElapsedHours;
+  ship.expectedArrivalHours = actualElapsedHours;
+
+  if (!appConfig.onTheFlyModelTraining) return;
+
+  const dist = ship.roadDistanceMiles || (Math.sqrt(Math.pow(ship.path[ship.path.length - 1].lat - ship.path[0].lat, 2) + Math.pow(ship.path[ship.path.length - 1].long - ship.path[0].long, 2)) * 69.0);
+  const idealHours = dist / Math.max(ship.speedLimit || 50.0, 1);
+  const actualDelayRatio = (actualElapsedHours - idealHours) / Math.max(idealHours, 0.1);
+
+  fetch('http://localhost:8000/api/train', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      origin: ship.origin || 'Unknown',
+      destination: ship.destination || 'Unknown',
+      distance: dist,
+      speed: ship.speedLimit || 50.0,
+      traffic_level: new Date().getHours() > 8 && new Date().getHours() < 18 ? 8 : 3,
+      weather_severity: ship.delayAccumulated > 2 ? 8 : 2,
+      carrier_rating: 4.5,
+      actual_eta_hours: actualElapsedHours,
+      delay_probability: Math.min(Math.max(actualDelayRatio, 0.0), 1.0)
+    })
+  }).catch(err => console.error('ML Training error:', err));
+};
 
 // GTA-Style Dynamic World Events Engine
 let activeEvents = [];
@@ -230,12 +456,15 @@ setInterval(() => {
 
 setInterval(() => {
   activeShipments = activeShipments.map(ship => {
-    if (ship.status === 'Delivered') return ship;
+    if (ship.status?.includes('Delivered')) return ship;
+    const tickHours = SIM_HOURS_PER_TICK * simSpeedMultiplier;
+    ship.elapsedHours = parseFloat(((ship.elapsedHours || 0) + tickHours).toFixed(2));
+    updateLiveTelemetry(ship);
     
     // Check if stopped at a waypoint for unloading
     if (ship.stopTimer > 0) {
-      ship.stopTimer -= 1000 * simSpeedMultiplier; 
-      ship.status = `Unloading (${Math.ceil(ship.stopTimer/1000)}s)`;
+      ship.stopTimer = Math.max(0, ship.stopTimer - tickHours);
+      ship.status = `Unloading (${ship.stopTimer.toFixed(1)}h)`;
       if (ship.stopTimer <= 0) ship.status = 'In Transit';
       return ship;
     }
@@ -254,17 +483,15 @@ setInterval(() => {
     const longDiff = ship.targetLong - ship.long;
     const distToTarget = Math.sqrt(latDiff * latDiff + longDiff * longDiff);
     
-    // Convert speed back to map degrees per tick (Accelerated 6x)
-    let baseSpeed = (ship.speedLimit ? ship.speedLimit / 500 : 0.1) * simSpeedMultiplier; 
+    const remainingMapDistance = getRemainingMapDistance(ship);
+    const scheduledArrivalHours = ship.liveExpectedArrivalHours || ship.expectedArrivalHours || ship.eta || 0;
+    const remainingEtaHours = Math.max(scheduledArrivalHours - (ship.elapsedHours || 0), tickHours);
+    let baseSpeed = remainingMapDistance > 0 ? (remainingMapDistance / remainingEtaHours) * tickHours : 0;
     
     if (inEvent) {
-      // Events still physically slow the truck, but DON'T set "Delayed" status
-      if (inEvent.type === 'Accident') baseSpeed *= 0.05;
-      else if (inEvent.type === 'Storm') baseSpeed *= 0.20;
-      else if (inEvent.type === 'Breakdown') baseSpeed = 0;
-      else baseSpeed *= 0.50;
-
-      const hoursLost = 0.5 * simSpeedMultiplier;
+      const eventSpeedFactor = inEvent.type === 'Accident' ? 0.05 : inEvent.type === 'Storm' ? 0.20 : inEvent.type === 'Breakdown' ? 0 : 0.50;
+      const hoursLost = tickHours * (1 - eventSpeedFactor);
+      baseSpeed *= eventSpeedFactor;
       ship.delayAccumulated += hoursLost;
 
       // Record cause (merge with last entry if same type)
@@ -277,13 +504,15 @@ setInterval(() => {
 
       // Informational: track what event is affecting the truck (NOT a status change)
       ship.currentEvent = inEvent.type;
+      if (ship.lastPredictionEventId !== inEvent.id) refreshShipmentPrediction(ship, inEvent);
       ship.status = `In Transit (${inEvent.type} Zone)`;
     } else {
       ship.currentEvent = null;
       ship.status = 'In Transit';
     }
+    updateLiveTelemetry(ship);
     
-    if (distToTarget < baseSpeed) {
+    if (distToTarget <= Math.max(baseSpeed, 0.000001)) {
       if (ship.path && ship.pathIndex < ship.path.length - 2) {
         ship.pathIndex++;
         ship.lat = ship.targetLat;
@@ -293,54 +522,12 @@ setInterval(() => {
         
         // Stop at intermediate destinations
         if (ship.path[ship.pathIndex].isWaypoint) {
-           ship.stopTimer = 5000; // Stop for 5 seconds
-        }
+            ship.stopTimer = 0.25; // 15 model minutes unloading at each intermediate stop
+         }
       } else {
-        if (!ship.status.includes('Delivered')) {
-          // ML-DRIVEN DELIVERY CLASSIFICATION
-          // Compare actual delivery time vs ML-predicted ETA
-          const actualElapsedHours = (Date.now() - ship.startTime) / (1000 * 60 * 60);
-          const predictedEta = ship.eta; // ML model's prediction
-          const difference = actualElapsedHours - predictedEta;
-          
-          if (difference > 0.1) {
-            // Took longer than ML predicted → Delivered Late
-            ship.status = `Delivered Late (by ${difference.toFixed(1)}h)`;
-            ship.earlyBy = 0;
-          } else if (difference < -0.1) {
-            // Arrived faster than ML predicted → Delivered Early
-            const earlyBy = Math.abs(difference);
-            ship.status = `Delivered Early (by ${earlyBy.toFixed(1)}h)`;
-            ship.earlyBy = parseFloat(earlyBy.toFixed(1));
-          } else {
-            ship.status = 'Delivered On-Time';
-            ship.earlyBy = 0;
-          }
-          
-          // Continuous ML Learning: Report actual delivery data back to Python
-          // The model learns from ACTUAL delivery times to improve future predictions
-          const dist = ship.roadDistanceMiles || (Math.sqrt(Math.pow(ship.path[ship.path.length-1].lat - ship.path[0].lat, 2) + Math.pow(ship.path[ship.path.length-1].long - ship.path[0].long, 2)) * 69.0);
-          const idealHours = dist / Math.max(ship.speedLimit || 50.0, 1);
-          const actualDelayRatio = (actualElapsedHours - idealHours) / Math.max(idealHours, 0.1);
-          
-          fetch('http://localhost:8000/api/train', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              origin: ship.origin || "Unknown",
-              destination: ship.destination || "Unknown",
-              distance: dist,
-              speed: ship.speedLimit || 50.0,
-              traffic_level: new Date().getHours() > 8 && new Date().getHours() < 18 ? 8 : 3,
-              weather_severity: ship.delayAccumulated > 2 ? 8 : 2, 
-              carrier_rating: 4.5,
-              actual_eta_hours: actualElapsedHours,
-              delay_probability: Math.min(Math.max(actualDelayRatio, 0.0), 1.0)
-            })
-          }).catch(err => console.error("ML Training error:", err));
-        }
+        completeShipment(ship);
       }
-    } else {
+    } else if (distToTarget > 0 && baseSpeed > 0) {
       ship.lat += (latDiff / distToTarget) * baseSpeed;
       ship.long += (longDiff / distToTarget) * baseSpeed;
       ship.lat += (Math.random() - 0.5) * 0.005; 

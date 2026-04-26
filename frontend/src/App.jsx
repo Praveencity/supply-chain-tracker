@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { PackageSearch, Clock, BarChart2, Trash2 } from 'lucide-react';
 import DeliveryMap from './components/DeliveryMap';
 import StatCard from './components/StatCard';
@@ -145,7 +145,6 @@ function App() {
           </div>
           {selectedTruckId && (
             <AnalyticsPanel
-              shipments={shipments}
               selectedTruck={shipments.find(s => s.id === selectedTruckId)}
               clearSelection={() => setSelectedTruckId(null)}
             />
